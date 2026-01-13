@@ -87,7 +87,7 @@ def window_reverse(windows, window_size, Pl=1, Lat=1, Lon=1, ndim=3):
         return x
 
 
-def get_shift_window_mask(input_resolution, window_size, shift_size, ndim=3):
+def get_shift_window_mask(input_resolution, window_size, shift_size, ndim=3,periodic_lon=True):
     """
     Along the longitude dimension, the leftmost and rightmost indices are actually close to each other.
     If half windows apper at both leftmost and rightmost positions, they are dircetly merged into one window.
@@ -105,13 +105,17 @@ def get_shift_window_mask(input_resolution, window_size, shift_size, ndim=3):
         win_pl, win_lat, win_lon = window_size
         shift_pl, shift_lat, shift_lon = shift_size
 
-        img_mask = torch.zeros((1, Pl, Lat, Lon + shift_lon, 1))
+        # periodic_lon=True     :全球经度周期（左右边界相邻，原作者逻辑）
+        # periodic_lon=False    :区域经度非周期（左右边界不相邻，标准Swin思路）
+        Lon_mask = Lon + shift_lon if periodic_lon else Lon
+        img_mask = torch.zeros((1, Pl, Lat, Lon_mask, 1))
     elif ndim == 2:
         Lat, Lon = input_resolution
         win_lat, win_lon = window_size
         shift_lat, shift_lon = shift_size
 
-        img_mask = torch.zeros((1, Lat, Lon + shift_lon, 1))
+        Lon_mask = Lon + shift_lon if periodic_lon else Lon
+        img_mask = torch.zeros((1, Lat, Lon_mask, 1))
 
     if ndim == 3:
         pl_slices = (
@@ -137,13 +141,15 @@ def get_shift_window_mask(input_resolution, window_size, shift_size, ndim=3):
                 for lon in lon_slices:
                     img_mask[:, pl, lat, lon, :] = cnt
                     cnt += 1
-        img_mask = img_mask[:, :, :, :Lon, :]
+        if periodic_lon:
+            img_mask = img_mask[:, :, :, :Lon, :]
     elif ndim == 2:
         for lat in lat_slices:
             for lon in lon_slices:
                 img_mask[:, lat, lon, :] = cnt
                 cnt += 1
-        img_mask = img_mask[:, :, :Lon, :]
+        if periodic_lon:
+            img_mask = img_mask[:, :, :Lon, :]
 
     mask_windows = window_partition(
         img_mask, window_size, ndim=ndim

@@ -2,7 +2,7 @@
 Author: xiaoniu
 Date: 2026-01-10 18:35:25
 LastEditors: xiaoniu
-LastEditTime: 2026-01-12 23:46:38
+LastEditTime: 2026-01-13 18:54:24
 Description: 文件用途描述
 '''
 import torch
@@ -103,6 +103,7 @@ class FuserLayer(nn.Module):
         attn_drop=0.0,
         drop_path=0.0,
         norm_layer=nn.LayerNorm,
+        periodic_lon=True,
     ):
         super().__init__()
         self.dim = dim
@@ -126,6 +127,7 @@ class FuserLayer(nn.Module):
                     if isinstance(drop_path, Sequence)
                     else drop_path,
                     norm_layer=norm_layer,
+                    periodic_lon=periodic_lon,
                 )
                 for i in range(depth)
             ]
@@ -228,6 +230,7 @@ class Transformer3DBlock(nn.Module):
         drop_path=0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
+        periodic_lon=True,
     ):
         super().__init__()
         window_size = (2, 6, 12) if window_size is None else window_size
@@ -273,7 +276,7 @@ class Transformer3DBlock(nn.Module):
         self.roll = shift_pl and shift_lon and shift_lat
 
         if self.roll:
-            attn_mask = get_shift_window_mask(pad_resolution, window_size, shift_size)  #(num_lon, num_pl*num_lat, Wpl*Wlat*Wlon, Wpl*Wlat*Wlon)=(30,31x4,2x6x12,2x6x12)
+            attn_mask = get_shift_window_mask(pad_resolution, window_size, shift_size,periodic_lon=periodic_lon)  #(num_lon, num_pl*num_lat, Wpl*Wlat*Wlon, Wpl*Wlat*Wlon)=(30,31x4,2x6x12,2x6x12)
         else:
             attn_mask = None
 

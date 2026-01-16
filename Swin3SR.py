@@ -37,8 +37,99 @@ class Upsampler(nn.Module):
     '''
     Super Resolution for 2D data
     input(B,C_in,H,W) -> output(B,C_out,scale*H,scale*W)
-    residual_to_LR: whether to add bicubic upsampled input to output
+    residual_to_bicubic: whether to add bicubic upsampled input to output
     '''
+    def __init__(self, 
+                 in_channels,
+                 out_channels,
+                 scale=3,
+                 num_feat=128,
+                 residual_to_bicubic=False):
+        super().__init__()
+        assert scale in [2,4,8]
+        self.residual_to_bicubic = residual_to_bicubic
+        self.scale = scale
+        self.conv_in = nn.Conv2d(in_channels, num_feat, kernel_size=3, padding=1,stride=1)
+        self.body = nn.Sequential(
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(num_feat, num_feat, kernel_size=3, padding=1,stride=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(num_feat, num_feat, kernel_size=3, padding=1,stride=1),
+        )
+        self.conv_up = nn.Conv2d(num_feat, out_channels * (scale ** 2), kernel_size=3, padding=1,stride=1)
+        self.pixel_shuffle = nn.PixelShuffle(scale)
+    def forward(self, x):
+        '''
+        x: (B,C_in,H,W)
+        '''
+        B,C,H,W = x.shape
+        x = self.conv_in(x)
+        x = self.body(x)
+        x = self.conv_up(x)
+        x = self.pixel_shuffle(x)
+        if self.residual_to_bicubic:
+            x_upsampled = nn.functional.interpolate(x, scale_factor=self.scale, mode='bicubic', align_corners=False)
+            x = x + x_upsampled[:,:,:H*self.scale,:W*self.scale]
+        return x[:,:,:H*self.scale,:W*self.scale]
+
+
+class Upsampler3D(nn.Module):
+    '''
+    Super Resolution for 3D data using ConvTranspose3D
+    Only upsample H and W, keep D unchanged
+    input(B,C_in,D,H,W) -> output(B,C_out,D,scale*H,scale*W)
+    residual_to_interpolate: whether to add bilinear interpolated input to output
+    '''
+    def __init__(self, 
+                 in_channels,
+                 out_channels,
+                 scale=2,
+                 num_feat=128,
+                 residual_to_interpolate=False):
+        super().__init__()
+        assert scale in [2, 4, 8]
+        self.residual_to_interpolate = residual_to_interpolate
+        self.scale = scale
+        self.conv_in = nn.Conv3d(in_channels, num_feat, kernel_size=3, padding=1, stride=1)
+        self.body = nn.Sequential(
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(num_feat, num_feat, kernel_size=3, padding=1, stride=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(num_feat, num_feat, kernel_size=3, padding=1, stride=1),
+        )
+        # ConvTranspose3D layers for upsampling H and W only
+        self.conv_ups = nn.ModuleList()
+        in_feat = num_feat
+        current_scale = 1
+        while current_scale < scale:
+            # kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1) to keep D unchanged
+            self.conv_ups.append(
+                nn.ConvTranspose3d(in_feat, in_feat, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
+            )
+            current_scale *= 2
+        
+        self.conv_out = nn.Conv3d(in_feat, out_channels, kernel_size=3, padding=1, stride=1)
+    
+    def forward(self, x):
+        '''
+        x: (B,C_in,D,H,W)
+        output: (B,C_out,D,scale*H,scale*W)
+        '''
+        B, C, D, H, W = x.shape
+        x = self.conv_in(x)
+        x = self.body(x)
+        
+        # Upsample H and W using ConvTranspose3D layers
+        for conv_up in self.conv_ups:
+            x = conv_up(x)
+        
+        x = self.conv_out(x)
+        
+        if self.residual_to_interpolate:
+            x_upsampled = nn.functional.interpolate(x, scale_factor=(1, self.scale, self.scale), mode='trilinear', align_corners=False)
+            x = x + x_upsampled[:, :, :D, :H*self.scale, :W*self.scale]
+        
+        return x[:, :, :D, :H*self.scale, :W*self.scale]
     
 class SwinTransformer3D(nn.Module):
 
@@ -56,6 +147,8 @@ class SwinTransformer3D(nn.Module):
         use_upper_air=True,
         output_surface_channels=None,
         periodic_lon=True,
+        upsampler='pixelshuffle',
+        scale=4,
     ):
         super().__init__()
         drop_path = np.linspace(0, 0.2, 8).tolist()
@@ -65,7 +158,8 @@ class SwinTransformer3D(nn.Module):
         self.surface_mask_channels = surface_mask_channels
         self.upper_air_channels = upper_air_channels
         self.upper_air_variables = upper_air_variables
-
+        self.scale = scale
+        #SR part
         
         if output_surface_channels is None:
             self.output_surface_channels = surface_channels

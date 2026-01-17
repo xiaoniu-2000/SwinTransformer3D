@@ -2,8 +2,8 @@
 Author: xiaoniu
 Date: 2026-01-16 22:27:49
 LastEditors: xiaoniu
-LastEditTime: 2026-01-16 22:30:28
-Description: To be continued.
+LastEditTime: 2026-01-17 17:35:21
+Description: Swin Transformer 3D for Super Resolution.
 '''
 # SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
@@ -107,8 +107,13 @@ class Upsampler3D(nn.Module):
                 nn.ConvTranspose3d(in_feat, in_feat, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
             )
             current_scale *= 2
-        
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
         self.conv_out = nn.Conv3d(in_feat, out_channels, kernel_size=3, padding=1, stride=1)
+        self.residual_projector = None
+        if self.residual_to_interpolate:
+            self.residual_projector = nn.Identity() if in_channels == out_channels else nn.Conv3d(
+                in_channels, out_channels, kernel_size=1
+            )
     
     def forward(self, x):
         '''
@@ -116,18 +121,25 @@ class Upsampler3D(nn.Module):
         output: (B,C_out,D,scale*H,scale*W)
         '''
         B, C, D, H, W = x.shape
+        residual = x
         x = self.conv_in(x)
         x = self.body(x)
         
         # Upsample H and W using ConvTranspose3D layers
         for conv_up in self.conv_ups:
-            x = conv_up(x)
+            x = self.activation(conv_up(x))
         
         x = self.conv_out(x)
         
         if self.residual_to_interpolate:
-            x_upsampled = nn.functional.interpolate(x, scale_factor=(1, self.scale, self.scale), mode='trilinear', align_corners=False)
-            x = x + x_upsampled[:, :, :D, :H*self.scale, :W*self.scale]
+            base = self.residual_projector(residual)
+            base = nn.functional.interpolate(
+                base,
+                scale_factor=(1, self.scale, self.scale),
+                mode='trilinear',
+                align_corners=False,
+            )
+            x = x + base[:, :, :D, :H * self.scale, :W * self.scale]
         
         return x[:, :, :D, :H*self.scale, :W*self.scale]
     
@@ -144,11 +156,13 @@ class SwinTransformer3D(nn.Module):
         embed_dim=192,
         num_heads=(6, 12, 12, 6),
         window_size=(2, 6, 12),
-        use_upper_air=True,
+        use_upper_air=True,         
         output_surface_channels=None,
         periodic_lon=True,
-        upsampler='pixelshuffle',
+        upsampler=None,
         scale=4,
+        sr_feat=128,
+        residual_to_interpolate=False,
     ):
         super().__init__()
         drop_path = np.linspace(0, 0.2, 8).tolist()
@@ -159,8 +173,9 @@ class SwinTransformer3D(nn.Module):
         self.upper_air_channels = upper_air_channels
         self.upper_air_variables = upper_air_variables
         self.scale = scale
-        #SR part
-        
+        self.sr_feat = sr_feat
+        self.residual_to_interpolate = residual_to_interpolate
+        self.upsampler = upsampler
         if output_surface_channels is None:
             self.output_surface_channels = surface_channels
         else:
@@ -247,7 +262,33 @@ class SwinTransformer3D(nn.Module):
             )
         else:
             self.patchrecovery3d = None
-
+        # Super Resolution modules
+        if upsampler == 'pixelshuffle':
+            self.upsampler_surface = Upsampler(
+                in_channels=self.surface_channels,out_channels=self.output_surface_channels,
+                num_feat=self.sr_feat, scale=self.scale,residual_to_bicubic=self.residual_to_interpolate
+            )
+            self.upsampler_upper_air = Upsampler(
+                in_channels=self.upper_air_variables * self.upper_air_channels,
+                out_channels=self.upper_air_variables * self.upper_air_channels,
+                scale=self.scale,
+                num_feat=self.sr_feat,
+                residual_to_bicubic=self.residual_to_interpolate,
+            )
+        elif upsampler == 'ConvTranspose3D':
+            self.upsampler_surface = Upsampler3D(
+                in_channels=self.surface_channels,out_channels=self.output_surface_channels,
+                num_feat=self.sr_feat, scale=self.scale,residual_to_interpolate=self.residual_to_interpolate
+            )
+            self.upsampler_upper_air = None
+            if self.use_upper_air:
+                self.upsampler_upper_air = Upsampler3D(
+                    in_channels=self.upper_air_variables,out_channels=self.upper_air_variables,
+                    scale=self.scale,num_feat=self.sr_feat,residual_to_interpolate=self.residual_to_interpolate
+                )
+        else:
+            self.upsampler_surface = None
+            self.upsampler_upper_air = None
     def prepare_input(self, surface, surface_mask, upper_air=None):
         """Prepares the input to the model in the required shape.
         Args:
@@ -280,7 +321,6 @@ class SwinTransformer3D(nn.Module):
             x = surface.unsqueeze(2)
         B, C, Pl, Lat, Lon = x.shape    #经过(2,4,4)的patch后，变成(B, C, 8, 181, 360)
         x = x.reshape(B, C, -1).transpose(1, 2) #(B, C, Pl*Lat*Lon) -> (B, Pl*Lat*Lon, C)
-
         x = self.layer1(x)
 
         skip = x
@@ -295,11 +335,29 @@ class SwinTransformer3D(nn.Module):
         output = output.transpose(1, 2).reshape(B, -1, Pl, Lat, Lon)
         output_surface = output[:, :, 0, :, :]
         output_surface = self.patchrecovery2d(output_surface)
-        if not self.use_upper_air:
-            return output_surface
         output_upper_air = output[:, :, 1:, :, :]
         output_upper_air = self.patchrecovery3d(output_upper_air)
-        return output_surface, output_upper_air
+        # Super Resolution
+        if self.upsampler == 'pixelshuffle':
+            H,W = output_surface.shape[-2], output_surface.shape[-1]
+            output_surface = self.upsampler_surface(output_surface)
+            output_upper_air = output_upper_air.reshape(B, self.upper_air_variables * self.upper_air_channels, output_upper_air.shape[-2], output_upper_air.shape[-1])
+            output_upper_air = self.upsampler_upper_air(output_upper_air)
+            output_upper_air = output_upper_air.reshape(B, self.upper_air_variables, self.upper_air_channels, H * self.scale, W * self.scale)
+            return output_surface, output_upper_air
+        elif self.upsampler == 'ConvTranspose3D':
+            surface_3d = output_surface.unsqueeze(2)  # (B,C,H,W) -> (B,C,1,H,W)
+            surface_3d = self.upsampler_surface(surface_3d)
+            output_surface = surface_3d.squeeze(2)  # (B,C,1,H,W) -> (B,C,H,W)
+
+            if not self.use_upper_air:
+                return output_surface
+            output_upper_air = self.upsampler_upper_air(output_upper_air)
+            return output_surface, output_upper_air
+        else:
+            if not self.use_upper_air:
+                return output_surface
+            return output_surface, output_upper_air
 
 if __name__ == "__main__":
     lat,lon = 64,128
@@ -314,15 +372,19 @@ if __name__ == "__main__":
     upper_air = torch.randn(B,upper_air_variables,upper_air_channels,lat,lon)
     
     model = SwinTransformer3D(img_size=(lat,lon), 
-                  surface_channels=surface_channels, 
-                  surface_mask_channels=surface_mask_channels, 
-                  upper_air_channels=upper_air_channels, 
-                  upper_air_variables=upper_air_variables,
-                  patch_size=(2,4,4),
-                  embed_dim=48,
-                  num_heads=(3, 6, 12, 6),
-                  window_size=(2, 6, 12),
-                  periodic_lon=False,
+            surface_channels=surface_channels, 
+            surface_mask_channels=surface_mask_channels, 
+            upper_air_channels=upper_air_channels, 
+            upper_air_variables=upper_air_variables,
+            patch_size=(2,4,4),
+            embed_dim=48,
+            num_heads=(3, 6, 12, 6),
+            window_size=(2, 6, 12),
+            periodic_lon=False,
+            upsampler='ConvTranspose3D',
+            scale=4,
+            sr_feat=128,
+            residual_to_interpolate=False
     )
     x = model.prepare_input(surface,surface_mask,upper_air)
     out_surface, out_upper_air = model(x)
